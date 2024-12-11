@@ -21,3 +21,5 @@ This program was written as part of Fall 2024 EE 451 course project. The objecti
 3. Start Ollama server: `ollama server`
     To start the server on a specific address/port, set this environment variable before starting the server: `export OLLAMA_SERVER=http://[ip address]:[port number]`
 
+4. Run `./run_test.sh`
+
