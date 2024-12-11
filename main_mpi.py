@@ -1,9 +1,6 @@
-#!/usr/bin/env python3
-
-import requests
+from mpi4py import MPI
 import time
 import os
-from mpi4py import MPI
 import chrono_modules.ollama_helper as ollama_helper
 import resources.chrono_logging as chrono_logging
 import resources.common as cmn
@@ -11,45 +8,48 @@ import resources.common as cmn
 log = chrono_logging.get_logger("main", json=False)
 
 # Constants
-MAX_PROMPT_LENGTH = 3000
 DEFAULT_ROLE = "Generalist"
-IS_MEASURE_QUERY_RESPONSE = False
-
+IS_MEASURE_QUERY_RESPONSE_TIME = True
 input_file_path = os.path.abspath('data/prompts.txt')
 
-def process_task(task, agree_count, decision_count):
-    """Process a single task and update counters locally."""
-    model, prompt, layer, role = task
+
+def process_task(task):
+    """Process a single task and return results with prompt_id."""
+    prompt_id, model, prompt, layer, role = task
+    start_time = time.time()
 
     # Dynamically generate the prompt for Layer 3
     if layer == 3:
-        prompt = ollama_helper.generate_prompt(
-            prompt, layer=3, role=role, agree_count=agree_count, decision_count=decision_count)
+        prompt = ollama_helper.generate_prompt(prompt, layer=3, role=role)
 
     response = ollama_helper.query_ollama(model, prompt)
+    end_time = time.time()
+    if IS_MEASURE_QUERY_RESPONSE_TIME:
+        print(f"Task: {model}-{role or 'Generalist'} | Layer: {layer} | Time: {end_time - start_time:.2f} seconds")
 
     if response:
         result = ollama_helper.process_response(response)
-        decision_count += 1
-        if result.decision == "TRUE":
-            agree_count += 1
+        agree = 1 if result.decision == "TRUE" else 0
+        decision = 1
+    else:
+        agree = 0
+        decision = 0
 
-    return agree_count, decision_count
+    return prompt_id, agree, decision
 
 
 def distribute_tasks(prompts, models, roles):
-    """Distribute tasks for Layer 2 and Layer 3 among all workers."""
+    """Generate tasks with prompt_id for distribution."""
     tasks = []
-    for prompt in prompts:
-        
+    for prompt_id, prompt in enumerate(prompts):
         # Layer 2 tasks: Query each model as "Generalist"
         for model in models:
-            tasks.append((model, ollama_helper.generate_prompt(prompt, layer=2), 2, DEFAULT_ROLE))
+            tasks.append((prompt_id, model, ollama_helper.generate_prompt(prompt, layer=2), 2, DEFAULT_ROLE))
 
         # Layer 3 tasks: Query each model with role-specific prompts
         for model in models:
             for role in roles:
-                tasks.append((model, prompt, 3, role))
+                tasks.append((prompt_id, model, prompt, 3, role))
 
     return tasks
 
@@ -62,51 +62,63 @@ def main():
 
     # Load prompts and define models and roles
     if rank == 0:
-        # Read input prompts from a file
         with open(input_file_path) as f:
             prompts = [x.strip() for x in f.read().split('\n') if x.strip()]
-        
-        # Define models and roles 
         models = cmn.MODELS
         roles = cmn.ROLES
-
-        # Generate all tasks to be executed
         tasks = distribute_tasks(prompts, models, roles)
 
-        # Divide up tasks into subtasks for each process
-        subtask_size = len(tasks) // size
-        subtasks = [tasks[i * subtask_size:(i + 1) * subtask_size] for i in range(size)]
+        # Divide tasks into chunks for processes
+        chunk_size = len(tasks) // size
+        chunks = [tasks[i * chunk_size:(i + 1) * chunk_size] for i in range(size)]
 
-        # Handle any remaining tasks (in case number of tasks is not divisible by number of processes)
+        # Handle any remaining tasks
         for i in range(len(tasks) % size):
-            subtasks[i].append(tasks[subtask_size * size + i])
+            chunks[i].append(tasks[chunk_size * size + i])
     else:
-        subtasks = None
+        prompts = None
+        tasks = None
+        models = None
+        roles = None
+        chunks = None
+
+    # Broadcast models and roles
+    models = comm.bcast(models, root=0)
+    roles = comm.bcast(roles, root=0)
 
     # Scatter tasks among processes
-    tasks = comm.scatter(subtasks, root=0)
+    local_tasks = comm.scatter(chunks, root=0)
 
-    # Local counters
-    local_agree_counter = 0
-    local_decision_count = 0
+    # Process local tasks
+    local_results = []
+    for task in local_tasks:
+        local_results.append(process_task(task))
 
-    # Process assigned tasks
-    for task in tasks:
-        local_agree_counter, local_decision_count = process_task(
-            task, local_agree_counter, local_decision_count)
+    # Gather results at root
+    all_results = comm.gather(local_results, root=0)
 
-    # Gather results at the root process
-    global_agree_counter = comm.reduce(local_agree_counter, op=MPI.SUM, root=0)
-    global_decision_count = comm.reduce(local_decision_count, op=MPI.SUM, root=0)
-
-    # Root process computes and prints results
+    # Root process aggregates results
     if rank == 0:
-        score = global_agree_counter / global_decision_count if global_decision_count > 0 else 0
-        print("----------------------")
-        print(f"Total Agreements: {global_agree_counter}")
-        print(f"Total Decisions (# of queries made): {global_decision_count}")
-        print(f"Agreement Percentage: {score * 100:.2f}%")
-        print("----------------------")
+        # Aggregate by prompt_id
+        aggregated_results = {}
+        for process_results in all_results:
+            for prompt_id, agree, decision in process_results:
+                if prompt_id not in aggregated_results:
+                    aggregated_results[prompt_id] = {"agree": 0, "decision": 0}
+                aggregated_results[prompt_id]["agree"] += agree
+                aggregated_results[prompt_id]["decision"] += decision
+
+        # Log results per prompt
+        for prompt_id, counts in aggregated_results.items():
+            agree = counts["agree"]
+            decision = counts["decision"]
+            score = agree / decision if decision > 0 else 0
+            print("----------------------")
+            print(f"Prompt ID: {prompt_id}")
+            print(f"Total Agreements: {agree}")
+            print(f"Total Decisions: {decision}")
+            print(f"Agreement Percentage: {score * 100:.2f}%")
+            print("----------------------")
 
 
 if __name__ == "__main__":

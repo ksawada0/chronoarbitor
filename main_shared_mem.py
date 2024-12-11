@@ -1,99 +1,118 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
-import requests
-import json
-import time
 import os
+import time
 import chrono_modules.ollama_helper as ollama_helper
-from classes.DecisionResult import DecisionResult
+import resources.chrono_logging as chrono_logging
 import resources.common as cmn
 
-
+log = chrono_logging.get_logger("main", json=False)
 
 # Constants
-N_WORKERS = 4  # Number of threads
-MAX_PROMPT_LENGTH = 3000
+N_WORKERS = 1  # Number of threads
 DEFAULT_ROLE = "Generalist"
-IS_MEASURE_QUERY_RESPONSE = False
-
-# Thread-safe counters
-agree_counter_lock = Lock()
-decision_count_lock = Lock()
-global_agree_counter = 0
-global_decision_count = 0
+IS_MEASURE_QUERY_RESPONSE_TIME = True
+IS_LOG_RESPONSE = False
 
 input_file_path = os.path.abspath('data/prompts.txt')
 
+# Shared data structures
+results_lock = Lock()
+global_results = {}  # {prompt_id: {"agree": int, "decision": int}}
 
-def worker_task(task):
+
+def worker_task(task, local_results):
     """Thread worker to process a single task."""
-    global global_agree_counter, global_decision_count
-
-    model, prompt, layer, role = task
+    prompt_id, model, prompt, layer, role = task
     start_time = time.time()
-    
+
     # Dynamically generate the prompt for Layer 3
     if layer == 3:
-        prompt = ollama_helper.generate_prompt(prompt, layer=3, role=role, agree_count=global_agree_counter)
+        prompt = ollama_helper.generate_prompt(prompt, layer=3, role=role)
 
-    response = ollama_helper.query_ollama(model, prompt)
-    if response:
-        result = ollama_helper.process_response(response)
+    try:
+        response = ollama_helper.query_ollama(model, prompt)
         end_time = time.time()
-        if IS_MEASURE_QUERY_RESPONSE:
+
+        if IS_MEASURE_QUERY_RESPONSE_TIME:
             print(f"Task: {model}-{role or 'Generalist'} | Layer: {layer} | Time: {end_time - start_time:.2f} seconds")
 
-        with decision_count_lock:
-            global_decision_count += 1
-        if result.decision == "TRUE":
-            with agree_counter_lock:
-                global_agree_counter += 1
+        if response:
+            result = ollama_helper.process_response(response)
+            agree = 1 if result.decision == "TRUE" else 0
+            decision = 1
+        else:
+            agree = 0
+            decision = 0
+
+        # Update local results for this prompt_id
+        if prompt_id not in local_results:
+            local_results[prompt_id] = {"agree": 0, "decision": 0}
+        local_results[prompt_id]["agree"] += agree
+        local_results[prompt_id]["decision"] += decision
+
+    except Exception as e:
+        print(f"Error processing task {task}: {e}")
 
 
 def main():
-    global global_agree_counter, global_decision_count
-
     # Prompts and models
-    with open (input_file_path) as f:
-        prompts = [x.strip() for x in f.read().split('\n')]
+    with open(input_file_path) as f:
+        prompts = [x.strip() for x in f.read().split('\n') if x.strip()]
 
-    # Define models and roles
     models = cmn.MODELS
     roles = cmn.ROLES
+    print(f'Number of Threads: {N_WORKERS}')
+    print(f'Number of Models: {len(models)}')
+    print(f'Number of Roles: {len(roles)}')
 
     # Create tasks
     tasks = []
-
-    for prompt in prompts:
-        print(f'----------------------\nQuestion: {prompt}')
+    for prompt_id, prompt in enumerate(prompts):
         # Layer 2: Query each model as Generalist
         for model in models:
-                tasks.append((model, ollama_helper.generate_prompt(prompt, layer=2), 2, DEFAULT_ROLE))
+            tasks.append((prompt_id, model, ollama_helper.generate_prompt(prompt, layer=2), 2, DEFAULT_ROLE))
 
         # Layer 3: Query each model with role-specific prompts
         for model in models:
             for role in roles:
-                tasks.append((
-                    model,
-                    prompt,  # Pass the raw prompt here
-                    3,       # Layer
-                    role      # Specific role
-                ))
+                tasks.append((prompt_id, model, prompt, 3, role))
 
-        # Use ThreadPoolExecutor for parallelism
-        with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
-            executor.map(worker_task, tasks)
+    # Process tasks in parallel
+    def worker_wrapper(local_tasks):
+        local_results = {}  # Local storage for results
+        for task in local_tasks:
+            worker_task(task, local_results)
+        return local_results
 
-        # Log final results
-        score = global_agree_counter / global_decision_count if global_decision_count > 0 else 0
-        print(f"Total Agreements: {global_agree_counter}")
-        print(f"Total Decisions: {global_decision_count}")
+    with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
+        local_results_list = list(executor.map(worker_wrapper, [tasks[i::N_WORKERS] for i in range(N_WORKERS)]))
+
+    # Merge all local results into the global results
+    for local_results in local_results_list:
+        for prompt_id, counts in local_results.items():
+            with results_lock:
+                if prompt_id not in global_results:
+                    global_results[prompt_id] = {"agree": 0, "decision": 0}
+                global_results[prompt_id]["agree"] += counts["agree"]
+                global_results[prompt_id]["decision"] += counts["decision"]
+
+    # Log results per prompt
+    for prompt_id, counters in global_results.items():
+        agree = counters["agree"]
+        decision = counters["decision"]
+        score = agree / decision if decision > 0 else 0
+        print(f"----------------------")
+        print(f"Prompt ID: {prompt_id}")
+        print(f"Total Agreements: {agree}")
+        print(f"Total Decisions (# of queries made): {decision}")
         print(f"Agreement Percentage: {score * 100:.2f}%")
+        print(f"----------------------")
 
 
 if __name__ == "__main__":
     start_time = time.time()
     main()
     end_time = time.time()
-    elapsed_time = (end_time - start_time)/60
-    print(f'Elapsed Time = {elapsed_time :.1f} min.' )
+    elapsed_time = (end_time - start_time) / 60
+    print(f'Elapsed Time = {elapsed_time:.1f} min.')
